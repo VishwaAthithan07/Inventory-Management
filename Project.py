@@ -1,165 +1,245 @@
+"""A small JSON-backed command-line inventory manager."""
+
 import json
+import math
+import os
+import tempfile
+from pathlib import Path
 
-inventory = {}
-inventory_file = "inventory.json"
+
+INVENTORY_FILE = Path(__file__).with_name("inventory.json")
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "pass"
+USER_USERNAME = "user"
+USER_PASSWORD = "pass"
 
 
-def save_inventory():
-    f = open(inventory_file, "w")
-    json.dump(inventory, f)
-    f.close()
+class InventoryError(Exception):
+    """Raised when the saved inventory cannot be read or written safely."""
 
 
 def load_inventory():
-    f = open(inventory_file, "a+")
-    f.seek(0)
-    data = f.read()
-    if data != "":
-        global inventory
-        inventory = json.loads(data)
-    f.close()
+    """Read and validate inventory data from disk."""
+    if not INVENTORY_FILE.exists():
+        return {}
+
+    try:
+        with INVENTORY_FILE.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+    except (OSError, json.JSONDecodeError) as error:
+        raise InventoryError(f"Could not read {INVENTORY_FILE.name}: {error}") from error
+
+    if not isinstance(data, dict):
+        raise InventoryError("Inventory data must be a JSON object.")
+
+    for item_id, item in data.items():
+        if (
+            not isinstance(item_id, str)
+            or not isinstance(item, dict)
+            or not isinstance(item.get("name"), str)
+            or not isinstance(item.get("quantity"), int)
+            or isinstance(item.get("quantity"), bool)
+            or item["quantity"] < 0
+            or not isinstance(item.get("price"), (int, float))
+            or isinstance(item.get("price"), bool)
+            or not math.isfinite(item["price"])
+            or item["price"] < 0
+        ):
+            raise InventoryError(f"Invalid saved data for item ID '{item_id}'.")
+
+    return data
 
 
-def add_item():
-    load_inventory()
-    item_id = input("Enter item ID: ")
-    name = input("Enter name: ")
-    quantity = int(input("Enter quantity: "))
-    price = float(input("Enter price: "))
-    inventory[item_id] = {"name": name, "quantity": quantity, "price": price}
-    save_inventory()
+def save_inventory(inventory):
+    """Write inventory atomically so an interrupted save keeps the old file."""
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=INVENTORY_FILE.parent,
+            delete=False, suffix=".tmp"
+        ) as file:
+            temp_path = Path(file.name)
+            json.dump(inventory, file, indent=2, ensure_ascii=False)
+            file.write("\n")
+        os.replace(temp_path, INVENTORY_FILE)
+    except OSError as error:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise InventoryError(f"Could not save {INVENTORY_FILE.name}: {error}") from error
+
+
+def prompt_nonnegative_int(message):
+    while True:
+        try:
+            value = int(input(message))
+            if value < 0:
+                print("Enter zero or a positive whole number.")
+                continue
+            return value
+        except ValueError:
+            print("Enter a valid whole number.")
+
+
+def prompt_nonnegative_float(message):
+    while True:
+        try:
+            value = float(input(message))
+            if not math.isfinite(value) or value < 0:
+                print("Enter a finite, non-negative number.")
+                continue
+            return value
+        except ValueError:
+            print("Enter a valid number.")
+
+
+def add_item(inventory):
+    item_id = input("Enter item ID: ").strip()
+    if not item_id:
+        print("Item ID cannot be empty.")
+        return
+    if item_id in inventory:
+        print("That item ID already exists.")
+        return
+
+    name = input("Enter name: ").strip()
+    if not name:
+        print("Name cannot be empty.")
+        return
+
+    inventory[item_id] = {
+        "name": name,
+        "quantity": prompt_nonnegative_int("Enter quantity: "),
+        "price": prompt_nonnegative_float("Enter price: "),
+    }
+    save_inventory(inventory)
     print("Item added!")
 
 
-def update_item():
-    load_inventory()
-    item_id = input("Enter ID to update: ")
-    if item_id in inventory:
-        quantity = int(input("Enter new quantity: "))
-        price = float(input("Enter new price: "))
-        inventory[item_id]["quantity"] = quantity
-        inventory[item_id]["price"] = price
-        save_inventory()
-        print("Item updated!")
-    else:
+def update_item(inventory):
+    item_id = input("Enter ID to update: ").strip()
+    if item_id not in inventory:
         print("Item not found.")
+        return
+
+    inventory[item_id]["quantity"] = prompt_nonnegative_int("Enter new quantity: ")
+    inventory[item_id]["price"] = prompt_nonnegative_float("Enter new price: ")
+    save_inventory(inventory)
+    print("Item updated!")
 
 
-def remove_item():
-    load_inventory()
-    ids = input("Enter one or more IDs to remove (comma separated): ")
-    id_list = ids.split(",")
-    removed = False
-
-    for item_id in id_list:
-        item_id = item_id.strip()
+def remove_items(inventory):
+    item_ids = input("Enter one or more IDs to remove (comma separated): ").split(",")
+    removed = []
+    for item_id in dict.fromkeys(value.strip() for value in item_ids if value.strip()):
         if item_id in inventory:
             del inventory[item_id]
-            removed = True
+            removed.append(item_id)
             print(f"Removed: {item_id}")
         else:
             print(f"Item not found: {item_id}")
 
     if removed:
-        save_inventory()
+        save_inventory(inventory)
     else:
         print("No items removed.")
 
 
-def search_item():
-    load_inventory()
-    item_id = input("Enter ID to search: ")
-    if item_id in inventory:
-        item = inventory[item_id]
-        print("\n--- Item Found ---")
-        print("ID:", item_id)
-        print("Name:", item["name"])
-        print("Quantity:", item["quantity"])
-        print("Price:", item["price"])
-        print("------------------")
-    else:
+def search_item(inventory):
+    item_id = input("Enter ID to search: ").strip()
+    item = inventory.get(item_id)
+    if item is None:
         print("Item not found.")
+        return
+
+    print("\n--- Item Found ---")
+    print(f"ID:       {item_id}")
+    print(f"Name:     {item['name']}")
+    print(f"Quantity: {item['quantity']}")
+    print(f"Price:    {item['price']:.2f}")
 
 
-def list_inventory():
-    load_inventory()
-    if len(inventory) == 0:
+def list_inventory(inventory):
+    if not inventory:
         print("Inventory is empty.")
-    else:
-        print("\n--- INVENTORY LIST ---")
-        # print header
-        print(f"{'ID':<10} {'Name':<20} {'Quantity':<10} {'Price':<10}")
-        print("-" * 50)
-        # print each item in a formatted row
-        for key in inventory:
-            item = inventory[key]
-            print(f"{key:<10} {item['name']:<20} {item['quantity']:<10} {item['price']:<10.2f}")
-        print("-" * 50)
+        return
+
+    print("\n--- INVENTORY LIST ---")
+    print(f"{'ID':<14} {'Name':<24} {'Quantity':>10} {'Price':>12}")
+    print("-" * 64)
+    for item_id, item in sorted(inventory.items()):
+        print(
+            f"{item_id:<14} {item['name']:<24} "
+            f"{item['quantity']:>10} {item['price']:>12.2f}"
+        )
+    print("-" * 64)
 
 
-def admin_menu():
+def admin_menu(inventory):
+    actions = {"1": add_item, "2": update_item, "3": remove_items,
+               "4": search_item, "5": list_inventory}
     while True:
         print("\n=== ADMIN MENU ===")
-        print("1. Add item")
-        print("2. Update item")
-        print("3. Remove item (multiple allowed)")
-        print("4. Search item")
-        print("5. List inventory")
-        print("6. Logout")
-        choice = input("Enter your choice: ")
-
-        if choice == "1":
-            add_item()
-        elif choice == "2":
-            update_item()
-        elif choice == "3":
-            remove_item()
-        elif choice == "4":
-            search_item()
-        elif choice == "5":
-            list_inventory()
-        elif choice == "6":
+        print("1. Add item\n2. Update item\n3. Remove item(s)")
+        print("4. Search item\n5. List inventory\n6. Logout")
+        choice = input("Enter your choice: ").strip()
+        if choice == "6":
             print("Logging out (Admin)...")
-            break
+            return
+        action = actions.get(choice)
+        if action:
+            action(inventory)
         else:
             print("Invalid choice.")
 
 
-def user_menu():
+def user_menu(inventory):
     while True:
         print("\n=== USER MENU ===")
-        print("1. Search item")
-        print("2. List inventory")
-        print("3. Logout")
-        choice = input("Enter your choice: ")
-
+        print("1. Search item\n2. List inventory\n3. Logout")
+        choice = input("Enter your choice: ").strip()
         if choice == "1":
-            search_item()
+            search_item(inventory)
         elif choice == "2":
-            list_inventory()
+            list_inventory(inventory)
         elif choice == "3":
             print("Logging out (User)...")
-            break
+            return
         else:
             print("Invalid choice.")
+
+
+def login():
+    username = input("Enter username: ").strip()
+    password = input("Enter password: ")
+    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+        return "admin"
+    if username == USER_USERNAME and password == USER_PASSWORD:
+        return "user"
+    print("Invalid username or password.")
+    return None
 
 
 def main():
-    load_inventory()
-    while True:
-        print("\n=== LOGIN ===")
-        username = input("Enter username: ")
-        password = input("Enter password: ")
+    try:
+        inventory = load_inventory()
+        while True:
+            print("\n=== LOGIN ===")
+            role = login()
+            if role == "admin":
+                admin_menu(inventory)
+            elif role == "user":
+                user_menu(inventory)
 
-        if username == "admin" and password == "pass":
-            admin_menu()
+            again = input("Press Enter to log in again, or type 'exit' to quit: ")
+            if again.strip().lower() == "exit":
+                print("Exiting program...")
+                return
+    except (InventoryError, EOFError, KeyboardInterrupt) as error:
+        if isinstance(error, InventoryError):
+            print(f"Error: {error}")
         else:
-            user_menu()
-
-        again = input("Type 'exit' to quit or press Enter to login again: ")
-        if again.lower() == "exit":
-            print("Exiting program...")
-            break
+            print("\nProgram closed.")
 
 
-main()
+if __name__ == "__main__":
+    main()
